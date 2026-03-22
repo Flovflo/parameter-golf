@@ -7,10 +7,12 @@ Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `t
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import math
 import os
 import pickle
+import subprocess
 import sys
 import time
 import uuid
@@ -56,6 +58,8 @@ class Hyperparameters:
     train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
     train_seq_len: int = int(os.environ.get("TRAIN_SEQ_LEN", os.environ.get("TRAIN_MAX_SEQ_LEN", 1024)))
+    require_data_manifest: bool = bool(int(os.environ.get("REQUIRE_DATA_MANIFEST", "1")))
+    require_full_val_split: bool = bool(int(os.environ.get("REQUIRE_FULL_VAL_SPLIT", "1")))
     # Chunk each logical MLX microbatch into smaller sub-batches to reduce peak
     # memory pressure without changing the effective optimizer batch.
     mlx_max_microbatch_tokens: int = int(os.environ.get("MLX_MAX_MICROBATCH_TOKENS", 8_192))
@@ -74,12 +78,31 @@ class Hyperparameters:
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
+    mlp_hidden: int = int(os.environ.get("MLP_HIDDEN", 0))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
+    rope_dims: int = int(os.environ.get("ROPE_DIMS", 0))  # 0 = full head_dim; >0 = partial RoPE
+    ln_scale: bool = bool(int(os.environ.get("LN_SCALE", "0")))  # scale norms by 1/sqrt(layer+1)
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    bigram_hash_buckets: int = int(os.environ.get("BIGRAM_HASH_BUCKETS", 0))
+    trigram_hash_buckets: int = int(os.environ.get("TRIGRAM_HASH_BUCKETS", 0))
+    hash_dim: int = int(os.environ.get("HASH_DIM", 64))
+    hash_gate: bool = bool(int(os.environ.get("HASH_GATE", "1")))
+    hash_mixer_hidden: int = int(os.environ.get("HASH_MIXER_HIDDEN", 0))
+    hash_memory_buckets: int = int(os.environ.get("HASH_MEMORY_BUCKETS", 0))
+    hash_memory_dim: int = int(os.environ.get("HASH_MEMORY_DIM", 64))
+    hash_memory_recent_weight: float = float(os.environ.get("HASH_MEMORY_RECENT_WEIGHT", 0.2))
+    hash_memory_gate: bool = bool(int(os.environ.get("HASH_MEMORY_GATE", "1")))
+    hash_memory_chunk_size: int = int(os.environ.get("HASH_MEMORY_CHUNK_SIZE", 1))
+    hash_memory_min_count: int = int(os.environ.get("HASH_MEMORY_MIN_COUNT", 0))
+    hash_memory_mode: str = os.environ.get("HASH_MEMORY_MODE", "input")
+    hash_memory_count_alpha: float = float(os.environ.get("HASH_MEMORY_COUNT_ALPHA", 0.0))
+    hash_memory_scale: float = float(os.environ.get("HASH_MEMORY_SCALE", 1.0))
+    smear_gate: bool = bool(int(os.environ.get("SMEAR_GATE", "0")))
+    simple_bigram: bool = bool(int(os.environ.get("SIMPLE_BIGRAM", "0")))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -124,7 +147,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear",
     ).split(",")
     if pattern
 )
@@ -134,6 +157,11 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
         "INT8_KEEP_FLOAT_FP32_NAME_PATTERNS",
         ",".join(CONTROL_TENSOR_NAME_PATTERNS),
     ).split(",")
+    if pattern
+)
+INT8_KEEP_FLOAT_FP16_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("INT8_KEEP_FLOAT_FP16_NAME_PATTERNS", "tok_emb.weight").split(",")
     if pattern
 )
 
@@ -295,7 +323,7 @@ class RMSNormNoWeight(nn.Module):
 class CausalSelfAttention(nn.Module):
     # - separate q/k/v projections
     # - RMSNorm on q and k before attention
-    # - RoPE on q and k
+    # - RoPE on q and k (optionally partial)
     # - causal masked SDPA
     def __init__(
         self,
@@ -304,6 +332,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        rope_dims: int = 0,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -315,13 +344,16 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
+        self.rope_dims = rope_dims if rope_dims > 0 else self.head_dim
+        if self.rope_dims % 2 != 0:
+            raise ValueError("rope_dims must be even")
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim)
         self.c_k = CastedLinear(dim, kv_dim)
         self.c_v = CastedLinear(dim, kv_dim)
         self.proj = CastedLinear(dim, dim)
         self.q_gain = mx.ones((num_heads,), dtype=mx.float32) * qk_gain_init
-        self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
+        self.rope = nn.RoPE(self.rope_dims, traditional=False, base=rope_base)
         self.scale = self.head_dim ** -0.5
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -330,8 +362,16 @@ class CausalSelfAttention(nn.Module):
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
-        k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
+        q = rms_norm(q).astype(COMPUTE_DTYPE)
+        k = rms_norm(k).astype(COMPUTE_DTYPE)
+        if self.rope_dims < self.head_dim:
+            q_rope, q_pass = q[..., :self.rope_dims], q[..., self.rope_dims:]
+            k_rope, k_pass = k[..., :self.rope_dims], k[..., self.rope_dims:]
+            q = mx.concatenate([self.rope(q_rope), q_pass], axis=-1)
+            k = mx.concatenate([self.rope(k_rope), k_pass], axis=-1)
+        else:
+            q = self.rope(q)
+            k = self.rope(k)
         q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
         y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
@@ -340,15 +380,192 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # Baseline MLP uses relu^2 instead of GELU/SiLU. It is cheap and works well in this setup.
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, mlp_hidden: int = 0):
         super().__init__()
-        hidden = dim * mlp_mult
+        hidden = mlp_hidden if mlp_hidden > 0 else dim * mlp_mult
         self.fc = CastedLinear(dim, hidden)
         self.proj = CastedLinear(hidden, dim)
 
     def __call__(self, x: mx.array) -> mx.array:
         x = nn.relu(self.fc(x))
         return self.proj(x * x)
+
+
+def hashed_context_ids(input_ids: mx.array, buckets: int, order: int) -> mx.array:
+    if buckets <= 0 or order < 2:
+        return mx.zeros(input_ids.shape, dtype=mx.int32)
+    ids = input_ids.astype(mx.int64) + 1
+    bsz, seqlen = input_ids.shape
+    if order == 2 and seqlen > 1:
+        hashed = ((ids[:, :-1] * 1315423911) ^ (ids[:, 1:] * 2654435761)) % buckets
+        pad = mx.zeros((bsz, 1), dtype=mx.int64)
+        return mx.concatenate((pad, hashed), axis=1).astype(mx.int32)
+    if order == 3 and seqlen > 2:
+        hashed = ((ids[:, :-2] * 73856093) ^ (ids[:, 1:-1] * 19349663) ^ (ids[:, 2:] * 83492791)) % buckets
+        pad = mx.zeros((bsz, 2), dtype=mx.int64)
+        return mx.concatenate((pad, hashed), axis=1).astype(mx.int32)
+    return mx.zeros(input_ids.shape, dtype=mx.int32)
+
+
+class HashContinuationExpert(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        hash_dim: int,
+        bigram_buckets: int,
+        trigram_buckets: int,
+        use_gate: bool,
+        mixer_hidden: int,
+    ):
+        super().__init__()
+        self.bigram_buckets = bigram_buckets
+        self.trigram_buckets = trigram_buckets
+        self.use_gate = use_gate
+        self.mixer_hidden = mixer_hidden
+        self.bigram_emb = nn.Embedding(bigram_buckets, hash_dim) if bigram_buckets > 0 else None
+        self.trigram_emb = nn.Embedding(trigram_buckets, hash_dim) if trigram_buckets > 0 else None
+        feat_dim = hash_dim * int(self.bigram_emb is not None) + hash_dim * int(self.trigram_emb is not None)
+        self.proj = CastedLinear(feat_dim, dim) if feat_dim > 0 else None
+        gate_in_dim = dim * 2
+        self.gate_fc = CastedLinear(gate_in_dim, mixer_hidden) if use_gate and mixer_hidden > 0 and self.proj is not None else None
+        self.gate_proj = CastedLinear(mixer_hidden if mixer_hidden > 0 else gate_in_dim, dim) if use_gate and self.proj is not None else None
+        if self.proj is not None:
+            self.proj.weight = (mx.random.normal(self.proj.weight.shape, dtype=mx.float32) * 0.02).astype(COMPUTE_DTYPE)
+        if self.gate_proj is not None:
+            self.gate_proj.weight = mx.zeros_like(self.gate_proj.weight)
+
+    def __call__(self, input_ids: mx.array, base_x: mx.array) -> mx.array:
+        feats: list[mx.array] = []
+        if self.bigram_emb is not None:
+            feats.append(self.bigram_emb(hashed_context_ids(input_ids, self.bigram_buckets, 2)).astype(COMPUTE_DTYPE))
+        if self.trigram_emb is not None:
+            feats.append(self.trigram_emb(hashed_context_ids(input_ids, self.trigram_buckets, 3)).astype(COMPUTE_DTYPE))
+        if not feats or self.proj is None:
+            return mx.zeros_like(base_x)
+        x = feats[0] if len(feats) == 1 else mx.concatenate(feats, axis=-1)
+        x = self.proj(x).astype(COMPUTE_DTYPE)
+        if self.gate_proj is not None:
+            gate_in = mx.concatenate((base_x.astype(COMPUTE_DTYPE), x), axis=-1)
+            if self.gate_fc is not None:
+                gate_in = nn.relu(self.gate_fc(gate_in)).astype(COMPUTE_DTYPE)
+            x = x * mx.sigmoid(self.gate_proj(gate_in).astype(x.dtype))
+        return x
+
+
+class BigramHashEmbedding(nn.Module):
+    def __init__(self, num_buckets: int, bigram_dim: int, model_dim: int):
+        super().__init__()
+        self.num_buckets = num_buckets
+        self.embed = nn.Embedding(num_buckets, bigram_dim)
+        self.embed.weight = mx.zeros_like(self.embed.weight)
+        self.proj = CastedLinear(bigram_dim, model_dim) if bigram_dim != model_dim else None
+        if self.proj is not None:
+            self.proj.weight = mx.zeros_like(self.proj.weight)
+        self.scale = mx.array(0.05, dtype=mx.float32)
+
+    def hash_ids(self, input_ids: mx.array) -> mx.array:
+        ids = input_ids.astype(mx.int32)
+        mod = self.num_buckets - 1
+        out = mx.zeros_like(ids)
+        out[:, 0] = mod
+        out[:, 1:] = mx.bitwise_xor(36313 * ids[:, 1:], 27191 * ids[:, :-1]) % mod
+        return out.astype(mx.int32)
+
+    def __call__(self, input_ids: mx.array) -> mx.array:
+        h = self.embed(self.hash_ids(input_ids)).astype(COMPUTE_DTYPE)
+        if self.proj is not None:
+            h = self.proj(h).astype(COMPUTE_DTYPE)
+        return h * self.scale.astype(h.dtype)
+
+
+class DynamicHashMemoryExpert(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        memory_dim: int,
+        buckets: int,
+        recent_weight: float,
+        use_gate: bool,
+        chunk_size: int,
+        min_count: int,
+        count_alpha: float,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.memory_dim = memory_dim
+        self.buckets = buckets
+        self.recent_weight = float(np.clip(recent_weight, 0.0, 1.0))
+        self.use_gate = use_gate
+        self.chunk_size = max(int(chunk_size), 1)
+        self.min_count = max(int(min_count), 0)
+        self.count_alpha = max(float(count_alpha), 0.0)
+        self.value_proj = CastedLinear(dim, memory_dim) if buckets > 0 else None
+        self.out_proj = CastedLinear(memory_dim * 2, dim) if buckets > 0 else None
+        self.gate_proj = CastedLinear(dim * 2, 1) if use_gate and buckets > 0 else None
+        if self.out_proj is not None:
+            self.out_proj.weight = (mx.random.normal(self.out_proj.weight.shape, dtype=mx.float32) * 0.02).astype(COMPUTE_DTYPE)
+        if self.gate_proj is not None:
+            self.gate_proj.weight = mx.zeros_like(self.gate_proj.weight)
+
+    def __call__(self, input_ids: mx.array, target_ids: mx.array | None, base_x: mx.array, tok_emb_weight: mx.array) -> mx.array:
+        if self.buckets <= 0 or self.value_proj is None or self.out_proj is None or target_ids is None:
+            return mx.zeros_like(base_x)
+        bsz, seqlen = input_ids.shape
+        ctx_ids = hashed_context_ids(input_ids, self.buckets, 2)
+        tgt_emb = rms_norm(tok_emb_weight[target_ids].astype(COMPUTE_DTYPE))
+        values = self.value_proj(tgt_emb).astype(COMPUTE_DTYPE)
+        mem_sum = mx.zeros((bsz, self.buckets, self.memory_dim), dtype=COMPUTE_DTYPE)
+        mem_count = mx.zeros((bsz, self.buckets, 1), dtype=mx.float32)
+        mem_recent = mx.zeros((bsz, self.buckets, self.memory_dim), dtype=COMPUTE_DTYPE)
+        batch_idx = mx.arange(bsz, dtype=mx.int32)
+        outs: list[mx.array] = []
+        one = mx.ones((bsz, 1), dtype=mx.float32)
+        batch_grid = mx.arange(bsz, dtype=mx.int32)[:, None]
+        for s in range(0, seqlen, self.chunk_size):
+            e = min(s + self.chunk_size, seqlen)
+            bucket = ctx_ids[:, s:e]
+            recent = mem_recent[batch_grid, bucket]
+            count = mem_count[batch_grid, bucket]
+            avg = mem_sum[batch_grid, bucket] / mx.maximum(count, 1.0)
+            if self.recent_weight > 0.0:
+                mixed = self.recent_weight * recent + (1.0 - self.recent_weight) * avg
+                mem_feat = mx.concatenate((mixed, avg), axis=-1)
+            else:
+                mem_feat = mx.concatenate((recent, avg), axis=-1)
+            mem_out = self.out_proj(mem_feat).astype(COMPUTE_DTYPE)
+            if self.gate_proj is not None:
+                gate_in = mx.concatenate((base_x[:, s:e].astype(COMPUTE_DTYPE), mem_out), axis=-1)
+                mem_out = mem_out * mx.sigmoid(self.gate_proj(gate_in).astype(COMPUTE_DTYPE))
+            if self.min_count > 0:
+                active = (count >= float(self.min_count)).astype(mem_out.dtype)
+                mem_out = mem_out * active
+            if self.count_alpha > 0.0:
+                conf = count.astype(mem_out.dtype) / (count.astype(mem_out.dtype) + self.count_alpha)
+                mem_out = mem_out * conf
+            outs.append(mem_out)
+            val_chunk = values[:, s:e]
+            batch_flat = mx.repeat(batch_idx, e - s)
+            bucket_flat = bucket.reshape(-1)
+            val_flat = val_chunk.reshape(-1, self.memory_dim)
+            mem_sum = mem_sum.at[batch_flat, bucket_flat].add(val_flat)
+            mem_count = mem_count.at[batch_flat, bucket_flat].add(mx.ones((batch_flat.shape[0], 1), dtype=mx.float32))
+            for t in range(s, e):
+                bucket_t = ctx_ids[:, t]
+                val_t = values[:, t]
+                old_recent = mem_recent[batch_idx, bucket_t]
+                mem_recent = mem_recent.at[batch_idx, bucket_t].add(val_t - old_recent)
+        return mx.concatenate(outs, axis=1) if outs else mx.zeros_like(base_x)
+
+
+class SmearGate(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gate = mx.zeros((dim,), dtype=mx.float32)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        g = mx.sigmoid(self.gate.astype(x.dtype))[None, None, :]
+        x_prev = mx.concatenate((mx.zeros_like(x[:, :1]), x[:, :-1]), axis=1)
+        return (1.0 - g) * x + g * x_prev
 
 
 class Block(nn.Module):
@@ -360,12 +577,16 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        mlp_hidden: int = 0,
+        rope_dims: int = 0,
+        ln_scale_factor: float = 1.0,
     ):
         super().__init__()
+        self.ln_scale_factor = ln_scale_factor
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dims=rope_dims)
+        self.mlp = MLP(dim, mlp_mult, mlp_hidden=mlp_hidden)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
@@ -373,9 +594,10 @@ class Block(nn.Module):
     def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        s = self.ln_scale_factor
+        attn_out = self.attn(self.attn_norm(x) * s)
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x) * s)
         return x
 
 
@@ -386,20 +608,40 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, mlp_hidden: int = 0, rope_dims: int = 0, ln_scale: bool = False,
+                 bigram_hash_buckets: int = 0, trigram_hash_buckets: int = 0,
+                 hash_dim: int = 64, hash_gate: bool = True, hash_mixer_hidden: int = 0,
+                 hash_memory_buckets: int = 0, hash_memory_dim: int = 64,
+                 hash_memory_recent_weight: float = 0.2, hash_memory_gate: bool = True,
+                 hash_memory_chunk_size: int = 1, hash_memory_min_count: int = 0,
+                 hash_memory_mode: str = "input", hash_memory_count_alpha: float = 0.0,
+                 hash_memory_scale: float = 1.0, smear_gate: bool = False, simple_bigram: bool = False):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
+        self.hash_memory_mode = hash_memory_mode
+        self.hash_memory_scale = hash_memory_scale
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
+        self.bigram = BigramHashEmbedding(bigram_hash_buckets, hash_dim, dim) if simple_bigram and bigram_hash_buckets > 0 else None
+        self.hash_expert = None if self.bigram is not None else HashContinuationExpert(
+            dim, hash_dim, bigram_hash_buckets, trigram_hash_buckets, hash_gate, hash_mixer_hidden
+        )
+        self.hash_memory_expert = DynamicHashMemoryExpert(
+            dim, hash_memory_dim, hash_memory_buckets, hash_memory_recent_weight, hash_memory_gate,
+            hash_memory_chunk_size, hash_memory_min_count, hash_memory_count_alpha
+        )
+        self.smear = SmearGate(dim) if smear_gate else None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, mlp_hidden=mlp_hidden,
+                  rope_dims=rope_dims,
+                  ln_scale_factor=(1.0 / math.sqrt(i + 1)) if ln_scale else 1.0)
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
@@ -415,8 +657,21 @@ class GPT(nn.Module):
         c = self.logit_softcap
         return c * mx.tanh(logits / c)
 
-    def __call__(self, input_ids: mx.array) -> mx.array:
-        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+    def __call__(self, input_ids: mx.array, target_ids: mx.array | None = None) -> mx.array:
+        x = self.tok_emb(input_ids).astype(COMPUTE_DTYPE)
+        if self.bigram is not None:
+            x = x + self.bigram(input_ids).astype(x.dtype)
+        base_x = rms_norm(x)
+        if self.hash_expert is not None and self.hash_expert.proj is not None:
+            x = x + self.hash_expert(input_ids, base_x).astype(x.dtype)
+        x = rms_norm(x)
+        if self.smear is not None:
+            x = self.smear(x).astype(x.dtype)
+        mem_bias = None
+        if self.hash_memory_expert.out_proj is not None:
+            mem_bias = (self.hash_memory_scale * self.hash_memory_expert(input_ids, target_ids, x, self.tok_emb.weight)).astype(x.dtype)
+            if self.hash_memory_mode == "input":
+                x = x + mem_bias
         x0 = x
         skips: list[mx.array] = []
 
@@ -430,12 +685,14 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
+        if mem_bias is not None and self.hash_memory_mode == "output":
+            x = x + mem_bias
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
         # Cross-entropy over flattened tokens. We keep optional logit chunking because it is a useful
         # memory knob on Macs, but the common path is chunk_tokens=0 (single matmul + CE).
-        x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
+        x = self(input_ids, target_ids=target_ids).reshape(-1, self.tok_emb.weight.shape[1])
         y = target_ids.reshape(-1)
         if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
             logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
@@ -490,16 +747,16 @@ class SplitOptimizers:
     def __init__(self, model: GPT, args: Hyperparameters):
         self.args = args
         params = dict(tree_flatten(model.parameters()))
-        self.embed_key = "tok_emb.weight"
+        self.embed_keys = [k for k in ("tok_emb.weight", "bigram.embed.weight") if k in params]
         self.matrix_keys = [
             k
             for k, p in params.items()
-            if k.startswith("blocks.") and p.ndim == 2 and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+            if k not in self.embed_keys and p.ndim == 2 and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
         ]
         self.scalar_keys = [
             k
             for k, p in params.items()
-            if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            if k not in self.embed_keys and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS))
         ]
 
         self.muon = Muon(self.matrix_keys, params, args)
@@ -526,8 +783,8 @@ class SplitOptimizers:
         self.adam_embed.learning_rate = self.args.tied_embed_lr * lr_mul
         updated.update(
             self.adam_embed.apply_gradients(
-                {self.embed_key: grads[self.embed_key]},
-                {self.embed_key: params[self.embed_key]},
+                {k: grads[k] for k in self.embed_keys},
+                {k: params[k] for k in self.embed_keys},
             )
         )
 
@@ -611,6 +868,13 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str,
             stats["int8_payload_bytes"] += int(passthrough[name].nbytes)
             continue
 
+        if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP16_NAME_PATTERNS):
+            passthrough_orig_dtypes[name] = str(arr.dtype).split(".")[-1]
+            kept = np.ascontiguousarray(np.array(arr.astype(mx.float16), dtype=INT8_KEEP_FLOAT_STORE_DTYPE, copy=False))
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += int(kept.nbytes)
+            continue
+
         # Small float tensors are cheap enough to keep directly. We still downcast
         # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
         if int(arr.size) <= INT8_KEEP_FLOAT_MAX_NUMEL:
@@ -689,53 +953,203 @@ def build_sentencepiece_luts(
     return base_bytes_lut, has_leading_space_lut, is_boundary_token_lut
 
 
-def validate_dataset_tokenizer_pair(data_path: str, tokenizer_path: str) -> tuple[str, int, int | None]:
-    # The shard directory and tokenizer are coupled: val_bpb is only meaningful if we
-    # decode bytes with the exact tokenizer that produced the shards. The manifest
-    # lets the training script fail fast on accidental dataset/tokenizer mismatches.
-    dataset_dir = Path(data_path).resolve()
-    actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    if len(dataset_dir.parents) < 2:
-        return dataset_dir.name, actual_train_files, None
-    manifest_path = dataset_dir.parents[1] / "manifest.json"
-    if not manifest_path.is_file():
-        return dataset_dir.name, actual_train_files, None
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(1 << 20)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
 
+
+def shard_indices(dataset_dir: Path, split: str) -> list[int]:
+    indices: list[int] = []
+    for path in sorted(dataset_dir.glob(f"fineweb_{split}_*.bin")):
+        suffix = path.stem.rsplit("_", 1)[-1]
+        if not suffix.isdigit():
+            raise ValueError(f"Unexpected shard filename: {path.name}")
+        indices.append(int(suffix))
+    return indices
+
+
+def validate_shard_layout(
+    dataset_dir: Path,
+    *,
+    split: str,
+    expected_files: int | None,
+    allow_prefix_subset: bool,
+) -> int:
+    indices = shard_indices(dataset_dir, split)
+    if not indices:
+        raise FileNotFoundError(f"No {split} shards found in {dataset_dir}")
+    if indices != list(range(len(indices))):
+        raise ValueError(f"{dataset_dir.name} has non-contiguous {split} shard indices: {indices[:8]}...")
+    if expected_files is None:
+        return len(indices)
+    if allow_prefix_subset:
+        if len(indices) > expected_files:
+            raise ValueError(f"{dataset_dir.name} has too many {split} shards: found {len(indices)}, expected {expected_files}")
+        return len(indices)
+    if len(indices) != expected_files:
+        raise ValueError(f"{dataset_dir.name} must use the full {split} split: found {len(indices)}, expected {expected_files}")
+    return len(indices)
+
+
+def validate_dataset_tokenizer_pair(
+    *,
+    data_path: str,
+    tokenizer_path: str,
+    sp: spm.SentencePieceProcessor,
+    vocab_size: int,
+    require_manifest: bool,
+    require_full_val_split: bool,
+) -> dict[str, object]:
+    dataset_dir = Path(data_path).resolve()
+    tokenizer_file = Path(tokenizer_path).resolve()
+    info: dict[str, object] = {
+        "dataset_name": dataset_dir.name,
+        "manifest_path": None,
+        "tokenizer_name": None,
+        "tokenizer_kind": None,
+        "tokenizer_sha256": sha256_file(tokenizer_file),
+        "docs_sha256": None,
+        "actual_train_files": len(list(dataset_dir.glob("fineweb_train_*.bin"))),
+        "expected_train_files": None,
+        "actual_val_files": len(list(dataset_dir.glob("fineweb_val_*.bin"))),
+        "expected_val_files": None,
+        "expected_docs_val": None,
+        "bos_id": int(sp.bos_id()),
+        "eos_id": int(sp.eos_id()),
+    }
+    if int(sp.vocab_size()) != vocab_size:
+        raise ValueError(f"VOCAB_SIZE={vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}")
+
+    manifest_path = dataset_dir.parents[1] / "manifest.json" if len(dataset_dir.parents) >= 2 else None
+    if manifest_path is None or not manifest_path.is_file():
+        if require_manifest:
+            raise FileNotFoundError(f"manifest.json is required for {dataset_dir}, got none at {manifest_path}")
+        return info
+
+    info["manifest_path"] = str(manifest_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    info["docs_sha256"] = ((manifest.get("docs_meta") or {}).get("docs_sha256"))
     dataset_entry = next((x for x in manifest.get("datasets", []) if x.get("name") == dataset_dir.name), None)
     if dataset_entry is None:
-        return dataset_dir.name, actual_train_files, None
-
+        raise ValueError(f"{dataset_dir.name} not found in {manifest_path}")
     tokenizer_name = dataset_entry.get("tokenizer_name")
     tokenizer_entry = (
         next((x for x in manifest.get("tokenizers", []) if x.get("name") == tokenizer_name), None)
         if tokenizer_name
         else None
     )
-    expected_name = Path((tokenizer_entry or {}).get("model_path") or (tokenizer_entry or {}).get("path") or "").name
-    if expected_name and Path(tokenizer_path).name != expected_name:
-        raise ValueError(f"{dataset_dir.name} expects tokenizer {expected_name}, got {Path(tokenizer_path).name}")
-    expected_train_files = (dataset_entry.get("stats") or {}).get("files_train")
-    if expected_train_files is not None:
-        expected_train_files = int(expected_train_files)
-        if actual_train_files > expected_train_files:
-            raise ValueError(
-                f"{dataset_dir.name} has more train shards than expected: found {actual_train_files}, "
-                f"manifest says {expected_train_files}"
-            )
-    return dataset_dir.name, actual_train_files, expected_train_files
+    if tokenizer_name and tokenizer_entry is None:
+        raise ValueError(f"Tokenizer {tokenizer_name} for {dataset_dir.name} is missing from {manifest_path}")
+    info["tokenizer_name"] = tokenizer_name
+    info["tokenizer_kind"] = dataset_entry.get("tokenizer_kind")
+    if dataset_entry.get("vocab_size") is not None and int(dataset_entry["vocab_size"]) != vocab_size:
+        raise ValueError(f"{dataset_dir.name} expects vocab_size={dataset_entry['vocab_size']}, got {vocab_size}")
+    if dataset_entry.get("bos_id") is not None and int(dataset_entry["bos_id"]) != int(sp.bos_id()):
+        raise ValueError(f"{dataset_dir.name} expects bos_id={dataset_entry['bos_id']}, got {sp.bos_id()}")
+    if dataset_entry.get("eos_id") is not None and int(dataset_entry["eos_id"]) != int(sp.eos_id()):
+        raise ValueError(f"{dataset_dir.name} expects eos_id={dataset_entry['eos_id']}, got {sp.eos_id()}")
+    info["bos_id"] = int(dataset_entry.get("bos_id", sp.bos_id()))
+    info["eos_id"] = int(dataset_entry.get("eos_id", sp.eos_id()))
+
+    expected_model_rel = (tokenizer_entry or {}).get("model_path") or (tokenizer_entry or {}).get("path")
+    expected_name = Path(expected_model_rel or "").name
+    if expected_name and tokenizer_file.name != expected_name:
+        raise ValueError(f"{dataset_dir.name} expects tokenizer {expected_name}, got {tokenizer_file.name}")
+    if expected_model_rel:
+        expected_model_path = (manifest_path.parent / expected_model_rel).resolve()
+        if expected_model_path.is_file():
+            expected_sha256 = sha256_file(expected_model_path)
+            if expected_sha256 != info["tokenizer_sha256"]:
+                raise ValueError(
+                    f"{dataset_dir.name} tokenizer content hash mismatch: expected {expected_sha256}, got {info['tokenizer_sha256']}"
+                )
+            expected_sp = spm.SentencePieceProcessor(model_file=str(expected_model_path))
+            for field in ("bos_id", "eos_id", "pad_id", "unk_id"):
+                if getattr(expected_sp, field)() != getattr(sp, field)():
+                    raise ValueError(f"{dataset_dir.name} tokenizer {field} mismatch against manifest model")
+            for token_id in range(int(sp.vocab_size())):
+                if expected_sp.id_to_piece(token_id) != sp.id_to_piece(token_id):
+                    raise ValueError(f"{dataset_dir.name} tokenizer piece mismatch at id={token_id}")
+
+    stats = dataset_entry.get("stats") or {}
+    if stats.get("files_train") is not None:
+        info["expected_train_files"] = int(stats["files_train"])
+    if stats.get("files_val") is not None:
+        info["expected_val_files"] = int(stats["files_val"])
+    if stats.get("docs_val") is not None:
+        info["expected_docs_val"] = int(stats["docs_val"])
+    info["actual_train_files"] = validate_shard_layout(
+        dataset_dir,
+        split="train",
+        expected_files=info["expected_train_files"],
+        allow_prefix_subset=True,
+    )
+    info["actual_val_files"] = validate_shard_layout(
+        dataset_dir,
+        split="val",
+        expected_files=info["expected_val_files"],
+        allow_prefix_subset=not require_full_val_split,
+    )
+    return info
 
 
-def load_validation_tokens(pattern: str, seq_len: int) -> np.ndarray:
+def validate_bos_consistency(val_tokens: np.ndarray, *, bos_id: int, expected_docs_val: int | None) -> None:
+    if val_tokens.size == 0:
+        raise ValueError("Validation tokens are empty")
+    if int(val_tokens[0]) != bos_id:
+        raise ValueError(f"Validation split must start with bos_id={bos_id}, got {int(val_tokens[0])}")
+    bos_positions = np.flatnonzero(val_tokens == bos_id)
+    if expected_docs_val is not None and int(bos_positions.size) != expected_docs_val:
+        raise ValueError(f"Expected {expected_docs_val} BOS markers in validation, got {int(bos_positions.size)}")
+    if bos_positions.size > 1 and np.any(np.diff(bos_positions) < 2):
+        raise ValueError("Validation document boundaries are malformed: adjacent BOS markers are too close")
+
+
+def git_commit_sha() -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    sha = result.stdout.strip()
+    return sha or None
+
+
+def append_jsonl(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, sort_keys=True))
+        f.write("\n")
+
+
+def load_validation_tokens_raw(pattern: str) -> np.ndarray:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
     # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
-    tokens = np.ascontiguousarray(np.concatenate([load_data_shard(file) for file in files], axis=0))
+    return np.ascontiguousarray(np.concatenate([load_data_shard(file) for file in files], axis=0))
+
+
+def truncate_validation_tokens(tokens: np.ndarray, seq_len: int) -> np.ndarray:
     usable = ((tokens.size - 1) // seq_len) * seq_len
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
+
+
+def load_validation_tokens(pattern: str, seq_len: int) -> np.ndarray:
+    return truncate_validation_tokens(load_validation_tokens_raw(pattern), seq_len)
 
 
 def loss_and_grad_chunked(
@@ -841,6 +1255,8 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     logfile = out_dir / f"{args.run_id}.txt"
+    metrics_path = out_dir / "runs.jsonl"
+    git_sha = git_commit_sha()
     print(logfile)
 
     def log(msg: str, console: bool = True) -> None:
@@ -861,15 +1277,21 @@ def main() -> None:
     if not args.tokenizer_path.endswith(".model"):
         raise ValueError(f"TOKENIZER_PATH must point to a SentencePiece .model file: {args.tokenizer_path}")
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
-    if int(sp.vocab_size()) != args.vocab_size:
-        raise ValueError(
-            f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
-        )
-    dataset_name, actual_train_files, expected_train_files = validate_dataset_tokenizer_pair(
-        args.data_path,
-        args.tokenizer_path,
+    dataset_info = validate_dataset_tokenizer_pair(
+        data_path=args.data_path,
+        tokenizer_path=args.tokenizer_path,
+        sp=sp,
+        vocab_size=args.vocab_size,
+        require_manifest=args.require_data_manifest,
+        require_full_val_split=args.require_full_val_split,
     )
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    raw_val_tokens = load_validation_tokens_raw(args.val_files)
+    validate_bos_consistency(
+        raw_val_tokens,
+        bos_id=int(dataset_info["bos_id"]),
+        expected_docs_val=dataset_info["expected_docs_val"],
+    )
+    val_tokens = truncate_validation_tokens(raw_val_tokens, args.train_seq_len)
 
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size
@@ -880,7 +1302,7 @@ def main() -> None:
     # ==============================================================================
     mx.random.seed(args.seed)
 
-    train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
+    train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=str(dataset_info["dataset_name"]))
 
     # ==============================================================================
     # MODEL + OPTIMIZER SETUP
@@ -892,11 +1314,30 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
+        mlp_hidden=args.mlp_hidden,
         logit_chunk_tokens=args.logit_chunk_tokens,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        rope_dims=args.rope_dims,
+        ln_scale=args.ln_scale,
+        bigram_hash_buckets=args.bigram_hash_buckets,
+        trigram_hash_buckets=args.trigram_hash_buckets,
+        hash_dim=args.hash_dim,
+        hash_gate=args.hash_gate,
+        hash_mixer_hidden=args.hash_mixer_hidden,
+        hash_memory_buckets=args.hash_memory_buckets,
+        hash_memory_dim=args.hash_memory_dim,
+        hash_memory_recent_weight=args.hash_memory_recent_weight,
+        hash_memory_gate=args.hash_memory_gate,
+        hash_memory_chunk_size=args.hash_memory_chunk_size,
+        hash_memory_min_count=args.hash_memory_min_count,
+        hash_memory_mode=args.hash_memory_mode,
+        hash_memory_count_alpha=args.hash_memory_count_alpha,
+        hash_memory_scale=args.hash_memory_scale,
+        smear_gate=args.smear_gate,
+        simple_bigram=args.simple_bigram,
     )
     opt = SplitOptimizers(model, args)
 
@@ -920,21 +1361,44 @@ def main() -> None:
     log(f"mlx_version:{mx.__version__}")
     log(f"train_loader:shards pattern={args.train_files}")
     log(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.size - 1}")
-    if expected_train_files is None:
-        log(f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files}")
-    elif actual_train_files < expected_train_files:
+    log(
+        f"dataset_manifest:path={dataset_info['manifest_path']} docs_sha256:{dataset_info['docs_sha256']} "
+        f"tokenizer_name:{dataset_info['tokenizer_name']} tokenizer_kind:{dataset_info['tokenizer_kind']}"
+    )
+    log(
+        f"tokenizer_identity:sha256={dataset_info['tokenizer_sha256']} "
+        f"bos_id:{dataset_info['bos_id']} eos_id:{dataset_info['eos_id']}"
+    )
+    if dataset_info["expected_train_files"] is None:
+        log(f"train_loader:dataset:{dataset_info['dataset_name']} train_shards:{dataset_info['actual_train_files']}")
+    elif dataset_info["actual_train_files"] < dataset_info["expected_train_files"]:
         log(
-            f"WARNING: train_loader:subset dataset:{dataset_name} "
-            f"train_shards:{actual_train_files}/{expected_train_files} "
+            f"WARNING: train_loader:subset dataset:{dataset_info['dataset_name']} "
+            f"train_shards:{dataset_info['actual_train_files']}/{dataset_info['expected_train_files']} "
             f"new epochs will arrive sooner than the full dataset"
         )
     else:
-        log(f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files}/{expected_train_files}")
+        log(
+            f"train_loader:dataset:{dataset_info['dataset_name']} "
+            f"train_shards:{dataset_info['actual_train_files']}/{dataset_info['expected_train_files']}"
+        )
+    log(
+        f"val_loader:dataset:{dataset_info['dataset_name']} "
+        f"val_shards:{dataset_info['actual_val_files']}/{dataset_info['expected_val_files']}"
+    )
     log(f"tokenizer_path:{args.tokenizer_path}")
     log(
         f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
-        f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
+        f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings} "
+        f"bigram_hash_buckets:{args.bigram_hash_buckets} trigram_hash_buckets:{args.trigram_hash_buckets} "
+        f"hash_dim:{args.hash_dim} hash_gate:{int(args.hash_gate)} hash_mixer_hidden:{args.hash_mixer_hidden} "
+        f"hash_memory_buckets:{args.hash_memory_buckets} hash_memory_dim:{args.hash_memory_dim} "
+        f"hash_memory_recent_weight:{args.hash_memory_recent_weight:.3f} hash_memory_gate:{int(args.hash_memory_gate)} "
+        f"hash_memory_chunk_size:{args.hash_memory_chunk_size} hash_memory_min_count:{args.hash_memory_min_count} "
+        f"hash_memory_mode:{args.hash_memory_mode} hash_memory_count_alpha:{args.hash_memory_count_alpha:.3f} "
+        f"hash_memory_scale:{args.hash_memory_scale:.3f} smear_gate:{int(args.smear_gate)} "
+        f"simple_bigram:{int(args.simple_bigram)}"
     )
     log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
@@ -950,6 +1414,7 @@ def main() -> None:
         f"muon_momentum:{args.muon_momentum} muon_steps:{args.muon_backend_steps}"
     )
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    log(f"final_eval_mode:flat bos_id:{dataset_info['bos_id']}")
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
     log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
@@ -993,9 +1458,11 @@ def main() -> None:
         mx.eval(warm_val_loss)
         mx.synchronize()
 
-        train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
+        train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=str(dataset_info["dataset_name"]))
 
     train_time_ms = 0.0
+    last_plain_val_loss: float | None = None
+    last_plain_val_bpb: float | None = None
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
     stop_after_step: int | None = None
     t0 = time.perf_counter()
@@ -1014,6 +1481,8 @@ def main() -> None:
                 is_boundary_token_lut,
                 log_fn=log,
             )
+            last_plain_val_loss = val_loss
+            last_plain_val_bpb = val_bpb
             if step % 25 == 0 or last_step:
                 log(
                     f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
@@ -1098,6 +1567,37 @@ def main() -> None:
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
     log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
     log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    append_jsonl(
+        metrics_path,
+        {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "git_sha": git_sha,
+            "run_id": args.run_id,
+            "script": "train_gpt_mlx.py",
+            "data_path": args.data_path,
+            "tokenizer_name": dataset_info["tokenizer_name"],
+            "tokenizer_sha256": dataset_info["tokenizer_sha256"],
+            "train_shards": dataset_info["actual_train_files"],
+            "val_shards": dataset_info["actual_val_files"],
+            "model_params": n_params,
+            "train_seq_len": args.train_seq_len,
+            "eval_seq_len": args.train_seq_len,
+            "eval_stride": 0,
+            "plain_val_loss": last_plain_val_loss,
+            "plain_val_bpb": last_plain_val_bpb,
+            "roundtrip_val_loss": q_val_loss,
+            "roundtrip_val_bpb": q_val_bpb,
+            "final_mode": "flat",
+            "final_val_loss": q_val_loss,
+            "final_val_bpb": q_val_bpb,
+            "train_time_ms": train_time_ms,
+            "eval_time_ms": q_eval_ms,
+            "raw_model_bytes": out_path.stat().st_size,
+            "quant_bytes": quant_file_bytes,
+            "code_bytes": len(code.encode("utf-8")),
+            "total_bytes": quant_file_bytes + len(code.encode("utf-8")),
+        },
+    )
 
 
 if __name__ == "__main__":

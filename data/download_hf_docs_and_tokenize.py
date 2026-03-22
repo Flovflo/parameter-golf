@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -252,7 +253,12 @@ def build_sentencepiece_tokenizer(*, spec: dict[str, Any], docs_jsonl: Path, tok
         raise RuntimeError("sentencepiece is required for SentencePiece tokenizer exports") from exc
 
     vocab_size = int(spec["vocab_size"])
-    prefix = tokenizers_dir / spec.get("model_prefix", f"fineweb_{vocab_size}_bpe")
+    model_prefix = spec.get("model_prefix")
+    if model_prefix is None:
+        stem = spec.get("dataset_suffix") or spec.get("name") or f"{vocab_size}_bpe"
+        safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", str(stem)).strip("._-") or f"{vocab_size}_bpe"
+        model_prefix = f"fineweb_{safe_stem}"
+    prefix = tokenizers_dir / str(model_prefix)
     model_path = prefix.with_suffix(".model")
     vocab_path = prefix.with_suffix(".vocab")
     prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -484,6 +490,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-root", required=True, help="Directory where docs, tokenizers, shards, and manifest are written")
     parser.add_argument(
+        "--docs-jsonl",
+        default=None,
+        help="Use an existing local docs_selected.jsonl instead of downloading it from Hugging Face.",
+    )
+    parser.add_argument(
         "--tokenizer-config",
         default=str(DEFAULT_CONFIG),
         help="Local tokenizer config JSON. Defaults to data/tokenizer_specs.json.",
@@ -524,23 +535,28 @@ def main() -> None:
     tokenizers_dir.mkdir(parents=True, exist_ok=True)
     datasets_dir.mkdir(parents=True, exist_ok=True)
 
-    docs_jsonl = output_root / DOCS_FILENAME
-    sidecar = output_root / SIDECAR_FILENAME
-    if not copy_from_hf_cache(
-        repo_id=args.repo_id,
-        remote_root=args.remote_root,
-        filename=DOCS_FILENAME,
-        destination=docs_jsonl,
-    ):
-        remote = f"{args.remote_root}/{DOCS_FILENAME}" if args.remote_root else DOCS_FILENAME
-        raise FileNotFoundError(f"{remote} not found in Hugging Face dataset repo {args.repo_id}")
-    if not copy_from_hf_cache(
-        repo_id=args.repo_id,
-        remote_root=args.remote_root,
-        filename=SIDECAR_FILENAME,
-        destination=sidecar,
-    ):
-        sidecar.unlink(missing_ok=True)
+    if args.docs_jsonl is not None:
+        docs_jsonl = Path(args.docs_jsonl).expanduser().resolve()
+        if not docs_jsonl.is_file():
+            raise FileNotFoundError(docs_jsonl)
+    else:
+        docs_jsonl = output_root / DOCS_FILENAME
+        sidecar = output_root / SIDECAR_FILENAME
+        if not copy_from_hf_cache(
+            repo_id=args.repo_id,
+            remote_root=args.remote_root,
+            filename=DOCS_FILENAME,
+            destination=docs_jsonl,
+        ):
+            remote = f"{args.remote_root}/{DOCS_FILENAME}" if args.remote_root else DOCS_FILENAME
+            raise FileNotFoundError(f"{remote} not found in Hugging Face dataset repo {args.repo_id}")
+        if not copy_from_hf_cache(
+            repo_id=args.repo_id,
+            remote_root=args.remote_root,
+            filename=SIDECAR_FILENAME,
+            destination=sidecar,
+        ):
+            sidecar.unlink(missing_ok=True)
 
     docs_sidecar = maybe_load_docs_sidecar_meta(docs_jsonl)
     docs_total = int(docs_sidecar["num_docs"]) if docs_sidecar is not None and docs_sidecar.get("num_docs") is not None else count_docs(docs_jsonl)

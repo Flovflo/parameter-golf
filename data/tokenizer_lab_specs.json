@@ -1,0 +1,69 @@
+{
+  "tokenizers": [
+    {
+      "name": "sp_bpe_1024_baseline",
+      "dataset_suffix": "sp1024_baseline",
+      "vocab_size": 1024,
+      "trainer_overrides": {
+        "max_sentence_length": 16384
+      }
+    },
+    {
+      "name": "sp_bpe_1024_web_loose",
+      "dataset_suffix": "sp1024_web_loose",
+      "vocab_size": 1024,
+      "trainer_overrides": {
+        "max_sentence_length": 16384,
+        "normalization_rule_name": "identity",
+        "split_by_whitespace": false,
+        "split_by_unicode_script": false,
+        "split_by_number": false,
+        "allow_whitespace_only_pieces": true,
+        "max_sentencepiece_length": 24
+      }
+    },
+    {
+      "name": "sp_bpe_1024_web_loose_nodigits",
+      "dataset_suffix": "sp1024_web_loose_nodigits",
+      "vocab_size": 1024,
+      "trainer_overrides": {
+        "max_sentence_length": 16384,
+        "normalization_rule_name": "identity",
+        "split_by_whitespace": false,
+        "split_by_unicode_script": false,
+        "split_by_number": false,
+        "split_digits": false,
+        "allow_whitespace_only_pieces": true,
+        "max_sentencepiece_length": 24
+      }
+    },
+    {
+      "name": "sp_bpe_1536_web_loose",
+      "dataset_suffix": "sp1536_web_loose",
+      "vocab_size": 1536,
+      "trainer_overrides": {
+        "max_sentence_length": 16384,
+        "normalization_rule_name": "identity",
+        "split_by_whitespace": false,
+        "split_by_unicode_script": false,
+        "split_by_number": false,
+        "allow_whitespace_only_pieces": true,
+        "max_sentencepiece_length": 24
+      }
+    },
+    {
+      "name": "sp_bpe_2048_web_loose",
+      "dataset_suffix": "sp2048_web_loose",
+      "vocab_size": 2048,
+      "trainer_overrides": {
+        "max_sentence_length": 16384,
+        "normalization_rule_name": "identity",
+        "split_by_whitespace": false,
+        "split_by_unicode_script": false,
+        "split_by_number": false,
+        "allow_whitespace_only_pieces": true,
+        "max_sentencepiece_length": 24
+      }
+    }
+  ]
+}

@@ -8,4 +8,7 @@ data/manifest.json
 data/docs_selected.jsonl
 .mypy_cache/
 .venv
+.venv-pg/
 logs/
+.runpod/
+artifacts/

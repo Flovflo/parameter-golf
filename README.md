@@ -106,6 +106,16 @@ You can rent GPUs from anywhere, but OpenAI is partnering with Runpod to make se
 
 3. Let's start with a 1xH100 pod. Deploy using the official Parameter Golf template: [Launch Template](https://console.runpod.io/deploy?template=y5cejece4j&ref=nl2r56th). Enable SSH terminal access, leaving the other settings at their defaults. Deploy your pod and SSH into it once it's up. You should land in `/workspace/`.
 
+If you want a repeatable CLI workflow on this fork, use the repo-local helper:
+
+```bash
+RUNPOD_API_KEY=... scripts/runpod.sh setup
+RUNPOD_GPU_ID="YOUR_GPU_ID" scripts/runpod.sh create parameter-golf-smoke
+scripts/runpod.sh smoke YOUR_POD_ID /workspace/parameter-golf
+```
+
+`setup` runs `runpodctl doctor` so the local SSH key exists and is registered. `create` launches a pod from the official template while overriding `PUBLIC_KEY` with your local Runpod key. `smoke` copies the minimal files needed for the root trainer, downloads `sp1024`, and runs a cheap CUDA smoke test remotely.
+
 On your remote machine, clone the repo onto local disk. All Python dependencies are already pre-installed in the image.
 
 ```bash
